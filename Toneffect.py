@@ -6,6 +6,7 @@ import soundfile as sf
 import sounddevice as sd
 from scipy.signal import butter, filtfilt, resample
 import subprocess
+from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -45,24 +46,33 @@ class DemucsAnalysisThread(QThread):
 
     def run(self):
         try:
-            # 1. Demucs 음원 분리
-            self.status_signal.emit("Demucs로 기타 트랙을 분리하는 중입니다... (시간이 다소 걸릴 수 있습니다)")
-            output_dir = "./separated"
+            self.status_signal.emit("Demucs로 기타 트랙을 분리하는 중입니다...")
+            
+            output_dir = Path("./separated").resolve()
+            
+            # 1. Demucs 명령 실행
             cmd = [
                 sys.executable, "-m", "demucs",
                 "-n", "htdemucs_6s",
                 "--two-stems", "guitar",
-                "-o", output_dir,
+                "-o", str(output_dir),
                 self.audio_path
             ]
             subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-            filename_without_ext = os.path.splitext(os.path.basename(self.audio_path))[0]
-            guitar_track_path = os.path.join(output_dir, "htdemucs_6s", filename_without_ext, "guitar.wav")
+            # 2. Demucs 결과 폴더 내부에서 'guitar.wav' 파일 자동 검색
+            # (폴더명이 길거나 특수문자가 있어도 감지하여 정확한 경로를 찾아냅니다)
+            guitar_files = list(output_dir.rglob("guitar.wav"))
 
-            # 2. DSP 톤 특징 분석
+            if not guitar_files:
+                raise FileNotFoundError("Demucs 분리 결과물에서 'guitar.wav' 파일을 찾을 수 없습니다.")
+
+            # 가장 최근에 생성된 guitar.wav 파일 선택
+            guitar_track_path = max(guitar_files, key=lambda p: p.stat().st_mtime)
+
+            # 3. DSP 톤 특징 분석
             self.status_signal.emit("기타 트랙 톤 데이터 분석 중...")
-            y = self.load_audio(guitar_track_path)
+            y = self.load_audio(str(guitar_track_path))
             y_clean = self._lowpass_filter(y, cutoff=10000, fs=self.sr)
 
             # Drive
