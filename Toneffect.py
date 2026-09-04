@@ -5,15 +5,66 @@ import re
 import numpy as np
 import soundfile as sf
 import sounddevice as sd
-from scipy.signal import butter, filtfilt, resample
+from scipy.signal import butter, filtfilt, resample, medfilt
 import subprocess
 from pathlib import Path
 import multiprocessing
+import platform
+import traceback
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QMessageBox, QFileDialog
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPointF
 from PyQt6.QtGui import QPainter, QColor, QPen, QFont, QBrush
+
+
+# ==========================================
+# 0. 보정된 드라이브 '게인 량(THD 고조파 왜곡률)' 연산 함수
+# ==========================================
+def _calculate_drive_score(y, sr=22050):
+    rms = np.sqrt(np.mean(y**2)) + 1e-6
+    if rms < 0.005:  # 노이즈 게이트 임계값
+        return 0.0
+
+    # 1. FFT 분석
+    fft_vals = np.abs(np.fft.rfft(y))
+    freqs = np.fft.rfftfreq(len(y), 1.0 / sr)
+
+    valid_mask = (freqs >= 80) & (freqs <= 8000)
+    if not np.any(valid_mask):
+        return 0.0
+
+    valid_freqs = freqs[valid_mask]
+    valid_fft = fft_vals[valid_mask]
+
+    # 2. Peak(기본음 f0 추정) 찾기
+    peak_idx = np.argmax(valid_fft)
+    f0 = valid_freqs[peak_idx]
+    f0_amp = valid_fft[peak_idx] + 1e-6
+
+    if f0 < 80:
+        return 0.0
+
+    # 3. 주요 고조파(2f0 ~ 6f0) 에너지 측정 (오차 대역 폭 10Hz로 압축)
+    harmonics_energy = 0.0
+    for h in range(2, 7):
+        h_freq = f0 * h
+        if h_freq > 8000:
+            break
+        h_mask = (freqs >= h_freq - 10) & (freqs <= h_freq + 10)
+        if np.any(h_mask):
+            harmonics_energy += np.max(fft_vals[h_mask])**2
+
+    # 4. THD 산출 및 압축(Compression) 적용
+    raw_thd = np.sqrt(harmonics_energy) / f0_amp
+    
+    # Log scale 압축을 적용하여 급격한 피킹 순간의 스파이크 수치 감쇄
+    compressed_thd = np.log1p(raw_thd * 2.0)
+
+    # Clean < 0.25, Overdrive ~ 0.6, Dist/High-gain > 1.0
+    drive_score = (compressed_thd / 0.9) * 100.0
+
+    return float(np.clip(drive_score, 0.0, 100.0))
 
 
 # ==========================================
@@ -38,7 +89,13 @@ class DemucsAnalysisThread(QThread):
             data = resample(data, num_samples)
         return data.astype(np.float32)
 
-    def _lowpass_filter(self, data, cutoff=10000, fs=22050, order=5):
+    def _highpass_filter(self, data, cutoff=50, fs=22050, order=4):
+        nyq = 0.5 * fs
+        normal_cutoff = cutoff / nyq
+        b, a = butter(order, normal_cutoff, btype='high', analog=False)
+        return filtfilt(b, a, data)
+
+    def _lowpass_filter(self, data, cutoff=6000, fs=22050, order=5):
         nyq = 0.5 * fs
         normal_cutoff = cutoff / nyq
         b, a = butter(order, normal_cutoff, btype='low', analog=False)
@@ -68,109 +125,181 @@ class DemucsAnalysisThread(QThread):
             ]
 
             if not guitar_files:
-                raise FileNotFoundError(f"음원 분리는 수행되었으나 결과 파일이 없습니다.\n경로: {output_dir}")
+                raise FileNotFoundError(f"음원 분리는 완료되었으나 결과 파일이 없습니다.\n경로: {output_dir}")
 
             guitar_track_path = max(guitar_files, key=lambda p: p.stat().st_mtime)
 
             y = self.load_audio(str(guitar_track_path))
-            y_clean = self._lowpass_filter(y, cutoff=10000, fs=self.sr)
+            y_hp = self._highpass_filter(y, cutoff=50, fs=self.sr)
+            y_clean = self._lowpass_filter(y_hp, cutoff=6000, fs=self.sr)
 
-            # Drive
-            frame_size, hop_size = 2048, 512
-            frames = [y_clean[i:i+frame_size] for i in range(0, len(y_clean)-frame_size, hop_size)]
-            rms_vals = [np.sqrt(np.mean(f**2)) for f in frames]
-            mean_rms = np.mean(rms_vals) if rms_vals else 1e-6
-            peak = np.max(np.abs(y_clean))
-            crest_factor = 20 * np.log10(peak / (mean_rms + 1e-6))
+            frame_length = int(self.sr * 1.0)
+            hop_length = int(self.sr * 0.25)
 
-            # EQ
-            fft_vals = np.abs(np.fft.rfft(y_clean))
-            freqs = np.fft.rfftfreq(len(y_clean), 1.0 / self.sr)
-            tot = np.sum(fft_vals) + 1e-6
-            low_r = np.sum(fft_vals[(freqs >= 100) & (freqs < 350)]) / tot
-            mid_r = np.sum(fft_vals[(freqs >= 350) & (freqs < 3000)]) / tot
-            high_r = np.sum(fft_vals[freqs >= 3000]) / tot
+            drive_scores = []
+            low_ratios = []
+            mid_ratios = []
+            high_ratios = []
 
-            # Modulation
-            zcrs = [np.sum(np.diff(np.signbit(y_clean[i:i+2048]))) / 2048 for i in range(0, len(y_clean)-2048, 512)]
-            zcr_std = np.std(zcrs) * 1000 if zcrs else 0
+            for start in range(0, len(y_clean) - frame_length, hop_length):
+                frame = y_clean[start:start + frame_length]
+                rms = np.sqrt(np.mean(frame**2))
+
+                if rms < 0.008:
+                    continue
+
+                d_score = _calculate_drive_score(frame, sr=self.sr)
+                
+                fft_vals = np.abs(np.fft.rfft(frame))
+                freqs = np.fft.rfftfreq(len(frame), 1.0 / self.sr)
+                valid_idx = (freqs >= 80) & (freqs <= 6000)
+                tot = np.sum(fft_vals[valid_idx]) + 1e-6
+
+                low_r = (np.sum(fft_vals[(freqs >= 80) & (freqs < 300)]) * 0.85) / tot
+                mid_r = np.sum(fft_vals[(freqs >= 300) & (freqs < 3000)]) / tot
+                high_r = (np.sum(fft_vals[(freqs >= 3000) & (freqs <= 6000)]) * 0.75) / tot
+
+                drive_scores.append(d_score)
+                low_ratios.append(low_r)
+                mid_ratios.append(mid_r)
+                high_ratios.append(high_r)
+
+            if not drive_scores:
+                raise ValueError("분석할 수 있는 유효한 기타 연주 구간이 음원에 존재하지 않습니다.")
+
+            # 유효 연주 구간 중 중간~상위 구간(40%~80%)의 안정된 드라이브 평균값 사용
+            sorted_indices = np.argsort(drive_scores)
+            idx_start = int(len(sorted_indices) * 0.4)
+            idx_end = int(len(sorted_indices) * 0.85)
+            target_indices = sorted_indices[idx_start:idx_end]
+
+            if len(target_indices) == 0:
+                target_indices = sorted_indices
+
+            target_drive = np.mean([drive_scores[i] for i in target_indices])
+            target_low = np.mean([low_ratios[i] for i in target_indices])
+            target_mid = np.mean([mid_ratios[i] for i in target_indices])
+            target_high = np.mean([high_ratios[i] for i in target_indices])
 
             target_json = {
-                "drive": {"crest_factor_db": round(float(crest_factor), 2)},
+                "drive": {"drive_score": round(float(target_drive), 2)},
                 "eq": {
-                    "low_ratio": round(float(low_r), 3),
-                    "mid_ratio": round(float(mid_r), 3),
-                    "high_ratio": round(float(high_r), 3)
+                    "low_ratio": round(float(target_low), 3),
+                    "mid_ratio": round(float(target_mid), 3),
+                    "high_ratio": round(float(target_high), 3)
                 },
-                "modulation": {"modulation_instability_score": round(float(zcr_std), 2)}
+                "modulation": {"modulation_instability_score": 0.0}
             }
 
             self.finished_signal.emit(target_json)
 
         except Exception as e:
-            self.error_signal.emit(str(e))
+            err_details = f"{str(e)}\n\n{traceback.format_exc()}"
+            self.error_signal.emit(err_details)
 
 
 class RealtimeAudioWorker(QThread):
     update_signal = pyqtSignal(float, dict)
 
-    def __init__(self, target_json, sr=22050, buffer_duration=1.0):
+    def __init__(self, target_json, sr=22050, buffer_duration=1.0, gate_threshold_db=-38.0):
         super().__init__()
         self.target = target_json
         self.sr = sr
         self.buffer_size = int(sr * buffer_duration)
         self.audio_buffer = np.zeros(self.buffer_size, dtype=np.float32)
         self.is_running = True
+        self.gate_threshold_db = gate_threshold_db
+        
+        # 지수 이동 평균(EMA) 및 링 버퍼 관련 변수
+        self.smoothed_drive = None
+        self.smoothed_low = None
+        self.smoothed_mid = None
+        self.smoothed_high = None
+        self.alpha = 0.25  # Smooth 계수 (낮을수록 보정이 강해짐)
 
-    def _lowpass_filter(self, data, cutoff=10000, fs=22050, order=5):
+    def _highpass_filter(self, data, cutoff=50, fs=22050, order=4):
+        nyq = 0.5 * fs
+        normal_cutoff = cutoff / nyq
+        b, a = butter(order, normal_cutoff, btype='high', analog=False)
+        return filtfilt(b, a, data)
+
+    def _lowpass_filter(self, data, cutoff=6000, fs=22050, order=5):
         nyq = 0.5 * fs
         normal_cutoff = cutoff / nyq
         b, a = butter(order, normal_cutoff, btype='low', analog=False)
         return filtfilt(b, a, data)
 
+    def _apply_noise_gate(self, y):
+        rms = np.sqrt(np.mean(y**2)) + 1e-6
+        db = 20 * np.log10(rms)
+        if db < self.gate_threshold_db:
+            return np.zeros_like(y)
+        return y
+
     def extract_features(self, y):
-        if np.max(np.abs(y)) < 0.01:
+        y_gated = self._apply_noise_gate(y)
+
+        if np.max(np.abs(y_gated)) < 0.002:
+            # 연주를 멈추면 필터 리셋
+            self.smoothed_drive = None
             return None
 
-        y_clean = self._lowpass_filter(y, cutoff=10000, fs=self.sr)
-        rms = np.sqrt(np.mean(y_clean**2)) + 1e-6
-        peak = np.max(np.abs(y_clean)) + 1e-6
-        crest_factor = 20 * np.log10(peak / rms)
+        y_hp = self._highpass_filter(y_gated, cutoff=50, fs=self.sr)
+        y_clean = self._lowpass_filter(y_hp, cutoff=6000, fs=self.sr)
+        y_clean = medfilt(y_clean, kernel_size=3)
+
+        curr_drive = _calculate_drive_score(y_clean, sr=self.sr)
 
         fft_vals = np.abs(np.fft.rfft(y_clean))
         freqs = np.fft.rfftfreq(len(y_clean), 1.0 / self.sr)
-        tot = np.sum(fft_vals) + 1e-6
-        low_r = np.sum(fft_vals[(freqs >= 100) & (freqs < 350)]) / tot
-        mid_r = np.sum(fft_vals[(freqs >= 350) & (freqs < 3000)]) / tot
-        high_r = np.sum(fft_vals[freqs >= 3000]) / tot
+        
+        valid_idx = (freqs >= 80) & (freqs <= 6000)
+        tot = np.sum(fft_vals[valid_idx]) + 1e-6
+
+        curr_low = (np.sum(fft_vals[(freqs >= 80) & (freqs < 300)]) * 0.85) / tot
+        curr_mid = np.sum(fft_vals[(freqs >= 300) & (freqs < 3000)]) / tot
+        curr_high = (np.sum(fft_vals[(freqs >= 3000) & (freqs <= 6000)]) * 0.75) / tot
+
+        # EMA(지수 이동 평균) 필터링으로 스파이크 수치 억제
+        if self.smoothed_drive is None:
+            self.smoothed_drive = curr_drive
+            self.smoothed_low = curr_low
+            self.smoothed_mid = curr_mid
+            self.smoothed_high = curr_high
+        else:
+            self.smoothed_drive = (self.alpha * curr_drive) + ((1 - self.alpha) * self.smoothed_drive)
+            self.smoothed_low = (self.alpha * curr_low) + ((1 - self.alpha) * self.smoothed_low)
+            self.smoothed_mid = (self.alpha * curr_mid) + ((1 - self.alpha) * self.smoothed_mid)
+            self.smoothed_high = (self.alpha * curr_high) + ((1 - self.alpha) * self.smoothed_high)
 
         return {
-            "crest_factor_db": crest_factor,
-            "low_ratio": low_r,
-            "mid_ratio": mid_r,
-            "high_ratio": high_r
+            "drive_score": self.smoothed_drive,
+            "low_ratio": self.smoothed_low,
+            "mid_ratio": self.smoothed_mid,
+            "high_ratio": self.smoothed_high
         }
 
     def calculate_offsets(self, current):
         if current is None:
             return 0.0, {"DRIVE": 0, "BASS": 0, "MID": 0, "TREBLE": 0}
 
-        t_drive = self.target["drive"]["crest_factor_db"]
+        t_drive = self.target["drive"].get("drive_score", 0.0)
         t_eq = self.target["eq"]
 
-        drive_diff = np.clip((current["crest_factor_db"] - t_drive) / 10.0, -2.0, 2.0)
-        low_diff = np.clip((current["low_ratio"] - t_eq["low_ratio"]) / 0.2, -2.0, 2.0)
-        mid_diff = np.clip((current["mid_ratio"] - t_eq["mid_ratio"]) / 0.2, -2.0, 2.0)
-        high_diff = np.clip((current["high_ratio"] - t_eq["high_ratio"]) / 0.2, -2.0, 2.0)
+        # 드라이브 편차 허용 오차 보정
+        drive_diff = np.clip((current["drive_score"] - t_drive) / 35.0, -2.0, 2.0)
+        low_diff = np.clip((current["low_ratio"] - t_eq["low_ratio"]) / 0.30, -2.0, 2.0)
+        mid_diff = np.clip((current["mid_ratio"] - t_eq["mid_ratio"]) / 0.30, -2.0, 2.0)
+        high_diff = np.clip((current["high_ratio"] - t_eq["high_ratio"]) / 0.30, -2.0, 2.0)
 
         offsets = {
-            "DRIVE": drive_diff,
-            "BASS": low_diff,
-            "MID": mid_diff,
-            "TREBLE": high_diff
+            "DRIVE": round(float(drive_diff), 2),
+            "BASS": round(float(low_diff), 2),
+            "MID": round(float(mid_diff), 2),
+            "TREBLE": round(float(high_diff), 2)
         }
 
-        total_err = (abs(drive_diff)*0.3) + (abs(low_diff)*0.2 + abs(mid_diff)*0.3 + abs(high_diff)*0.2)
+        total_err = (abs(drive_diff) * 0.4) + (abs(low_diff) * 0.2 + abs(mid_diff) * 0.2 + abs(high_diff) * 0.2)
         similarity = max(0.0, min(100.0, (1.0 - (total_err / 2.0)) * 100))
 
         return round(similarity, 1), offsets
@@ -195,7 +324,7 @@ class RealtimeAudioWorker(QThread):
 
 
 # ==========================================
-# 2. 커스텀 UI 위젯 (GuitarTunerApp보다 위에 선언)
+# 2. 커스텀 UI 위젯
 # ==========================================
 class CircleGaugeButton(QWidget):
     clicked = pyqtSignal()
@@ -358,7 +487,6 @@ class GuitarTunerApp(QMainWindow):
         self.tuner_scale.setFixedHeight(180)
         layout.addWidget(self.tuner_scale)
         
-        # 초기 숨김 처리
         self.tuner_scale.hide()
 
         container = QWidget()
@@ -392,7 +520,6 @@ class GuitarTunerApp(QMainWindow):
         self.target_json = target_json
         self.circle_btn.is_analyzing = False
         
-        # 분석 완료 시에만 하단 스케일 위젯 표출
         self.tuner_scale.show()
 
         self.audio_worker = RealtimeAudioWorker(target_json=self.target_json)
@@ -400,9 +527,15 @@ class GuitarTunerApp(QMainWindow):
         self.audio_worker.start()
 
     def on_analysis_error(self, err_msg):
-        QMessageBox.critical(self, "분석 오류", f"음원 분석 중 오류가 발생했습니다:\n{err_msg}")
         self.circle_btn.reset_ui()
         self.tuner_scale.hide()
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Critical)
+        msg.setWindowTitle("분석 오류 발생")
+        msg.setText("음원 분석 프로세스 중 오류가 발생했습니다.")
+        msg.setDetailedText(err_msg)
+        msg.exec()
 
     def update_gui_feedback(self, score, offsets):
         self.circle_btn.set_score(score)
@@ -418,9 +551,21 @@ class GuitarTunerApp(QMainWindow):
         event.accept()
 
 
+def force_mac_microphone_permission():
+    if platform.system() == "Darwin":
+        cmd = """
+        osascript -e 'tell application "System Events" to do shell script "echo request_mic"'
+        """
+        try:
+            subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     app = QApplication(sys.argv)
+    force_mac_microphone_permission()
     window = GuitarTunerApp()
     window.show()
     sys.exit(app.exec())
